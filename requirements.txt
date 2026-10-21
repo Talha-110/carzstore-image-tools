@@ -1,0 +1,10 @@
+# Versions tested in Chat 6 (2026-10-21) on Python 3.13
+rembg[cpu]==2.0.85
+onnxruntime==1.29.0
+fastapi==0.156.8
+uvicorn==0.54.0
+python-multipart==0.0.32
+pillow==12.3.0
+pillow-heif==1.8.1
+numpy==2.5.3
+scipy==1.18.1

@@ -1,0 +1,29 @@
+# Paste this into Hostinger hPanel -> VPS -> Docker Manager -> Compose -> Compose manually.
+# Before pasting, change ONE thing: YOUR_GITHUB_NAME (lowercase) on the image line.
+#
+# - No "ports:" on purpose: image-tools is NOT reachable from the internet.
+#   Only n8n can call it, at http://image-tools:8000 (same private network).
+# - mem_limit / cpus: image-tools can never use more than 4 GB RAM or 2 CPUs,
+#   so n8n always has room.
+services:
+  image-tools:
+    image: ghcr.io/YOUR_GITHUB_NAME/carzstore-image-tools:latest
+    container_name: image-tools
+    restart: unless-stopped
+    environment:
+      API_KEY: "CHANGE_ME"   # real key only in Hostinger, never in GitHub
+      CUTOUT_MODEL: "isnet-general-use"
+      HEAVY_JOBS: "1"
+      OMP_NUM_THREADS: "2"
+      MAX_FILE_MB: "20"
+      MIN_SHORT_SIDE_PX: "800"
+      LOW_RES_BELOW_PX: "1200"
+    mem_limit: 4g
+    cpus: 2
+    networks:
+      - n8n_net
+
+networks:
+  n8n_net:
+    external: true
+    name: n8n-tuny_default   # n8n's private network (project "n8n-tuny")
