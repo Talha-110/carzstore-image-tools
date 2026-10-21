@@ -34,6 +34,7 @@ jobs:
           tags: |
             ghcr.io/${{ env.OWNER }}/carzstore-image-tools:latest
             ghcr.io/${{ env.OWNER }}/carzstore-image-tools:${{ github.sha }}
+            ghcr.io/${{ env.OWNER }}/carzstore-image-tools:run-${{ github.run_number }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
