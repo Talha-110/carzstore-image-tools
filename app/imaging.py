@@ -172,6 +172,41 @@ class CutoutResult:
     meta: dict = field(default_factory=dict)
 
 
+def drop_small_pieces(cut: Image.Image) -> tuple[Image.Image, int]:
+    """Remove tiny loose pieces the cutout model kept by mistake — mostly caption
+    text on supplier photos ("Suzuki Swift 2023") and specks. Big separate pieces
+    (e.g. 4 floor mats in one photo) are kept.
+
+    A piece is dropped if it is smaller than CUTOUT_DROP_SMALL_PCT (default 2%)
+    of the biggest piece. Safety: if the small pieces together are more than
+    CUTOUT_DROP_MAX_SHARE (default 15%) of the product, nothing is dropped —
+    they are probably real parts (clips, screws) and a human should look.
+    """
+    pct = env_float("CUTOUT_DROP_SMALL_PCT", 2) / 100
+    if pct <= 0:
+        return cut, 0
+    alpha = np.asarray(cut.getchannel("A"))
+    solid = alpha > 10
+    # join pieces that touch or nearly touch (soft edges, thin straps)
+    joined = ndimage.binary_dilation(solid, iterations=2)
+    labels, n = ndimage.label(joined)
+    if n <= 1:
+        return cut, 0
+    sizes = np.asarray(ndimage.sum(solid, labels, range(1, n + 1)))
+    small = sizes < pct * sizes.max()
+    if not small.any():
+        return cut, 0
+    if sizes[small].sum() > env_float("CUTOUT_DROP_MAX_SHARE", 0.15) * sizes[~small].sum():
+        return cut, 0
+    remove_ids = np.flatnonzero(small) + 1
+    kill = np.isin(labels, remove_ids) & solid
+    new_alpha = alpha.copy()
+    new_alpha[kill] = 0
+    out = cut.copy()
+    out.putalpha(Image.fromarray(new_alpha))
+    return out, int(small.sum())
+
+
 def cutout(data: bytes, model: str | None = None) -> CutoutResult:
     from rembg import remove
 
@@ -185,6 +220,7 @@ def cutout(data: bytes, model: str | None = None) -> CutoutResult:
     except Exception as e:  # model crash, out of memory...
         raise ToolError("E11", f"Background removal failed: {e}", status=500)
     out = to_rgba(out)
+    out, dropped = drop_small_pieces(out)
 
     alpha = np.asarray(out.getchannel("A"))
     mask = alpha > 128
@@ -231,6 +267,8 @@ def cutout(data: bytes, model: str | None = None) -> CutoutResult:
         "box_pct": [round(box_w_pct, 1), round(box_h_pct, 1)],
         "hole_ratio": round(hole_ratio, 3),
         "pieces": big_pieces,
+        "small_pieces_removed": dropped,
+        "flags": ["SMALL_PIECES_REMOVED"] if dropped else [],
         "touches_edge": touches_edge,
         "check_ok": not problems,
         "check_code": None if not problems else "H01",
@@ -432,6 +470,10 @@ LAYOUTS = {
                          text_limit=0.64, max_lines=3),
 }
 
+# Side-by-side layouts: wide products (mat sets, body kits) may use up to 62% of the
+# width when they sit below/next to short text lines (04 s10 said 50%; Chat 6 change).
+PROMO_SIDE_MAX_W = 0.62
+
 STACKED_FALLBACK = {
     "STORE": PromoLayout(road_pct=0.16, text_max_w_pct=0.88, logo_w_pct=0.20,
                          product_area=(0.10, 0.90), product_max_w=0.70, product_max_h=0.45,
@@ -533,10 +575,12 @@ def _compose_promo(cut_bytes: bytes, headline: str, price: str | None,
                                   max_lines=L.max_lines)
     d = ImageDraw.Draw(canvas)
     line_h = int(hpx * 1.15)
-    text_box = [margin_x, y, margin_x, y]
+    # Every text piece keeps its own box, so the product can use the free space
+    # next to short lines and pills (not just right of the widest line).
+    rects = [(margin_x, logo_y, margin_x + logo.width, logo_y + logo.height)]
     for ln in lines:
         d.text((margin_x, y), ln, font=hf, fill=WHITE + (255,))
-        text_box[2] = max(text_box[2], margin_x + text_w(hf, ln))
+        rects.append((margin_x, y, margin_x + text_w(hf, ln), y + line_h))
         y += line_h
     y += int(hpx * 0.30)
 
@@ -550,48 +594,64 @@ def _compose_promo(cut_bytes: bytes, headline: str, price: str | None,
         box = (margin_x, y, margin_x + tw + 2 * padx, y + asc + desc + 2 * pady)
         rounded_box(d, box, radius=(box[3] - box[1]) // 2, fill=bg_col + (255,))
         d.text((margin_x + padx, y + pady), text, font=f, fill=fg + (255,))
-        text_box[2] = max(text_box[2], box[2])
+        rects.append(box)
         y = box[3] + int(px * 0.35)
 
     if price_text:
         pill(price_text, FONT_BOLD, int(H * L.price_pct), DARK_GREEN, WHITE)
     if offer:
         pill(offer, FONT_REGULAR, int(H * L.offer_pct), WHITE, DARK_GREEN)
-    text_box[3] = y
+    text_bottom = y
 
     limit_bottom = min(road_top, int(H * L.text_limit))
-    if text_box[3] > limit_bottom:
+    if text_bottom > limit_bottom:
         raise ToolError("E01", "promo text too long to fit above the product area")
     # STORY: product goes in the space between the text and the road
-    stack_top = text_box[3] + int(H * 0.02)
+    stack_top = text_bottom + int(H * 0.02)
     stack_room = road_top - int(H * 0.015) - stack_top
     if L.stacked and stack_room < H * 0.18:
         raise ToolError("E01", "promo text leaves too little room for the product")
 
-    # Product
-    def place(shrink: float):
-        ax0, ax1 = int(W * L.product_area[0]), int(W * L.product_area[1])
-        if not L.stacked:   # start the product to the right of the real text edge
-            ax0 = max(ax0, text_box[2] + int(W * 0.03))
-        max_w_px = int(min(W * L.product_max_w, max(ax1 - ax0, 1)) * shrink)
-        max_h_px = int(H * L.product_max_h * shrink)
-        if L.stacked:
-            max_h_px = int(min(max_h_px, stack_room) * shrink)
-        sc = min(max_w_px / cut.width, max_h_px / cut.height)
-        pc = cut.resize((max(1, int(cut.width * sc)), max(1, int(cut.height * sc))), Image.LANCZOS)
-        px_ = ax0 + (ax1 - ax0 - pc.width) // 2
-        px_ = min(px_, W - int(W * 0.04) - pc.width)
-        py_ = road_top - pc.height - int(H * 0.015)   # resting just above the road
-        return pc, px_, py_, sc
+    gap = int(min(W, H) * 0.025)
+    def hits_text(box):
+        return any(_overlap((r[0] - gap, r[1] - gap, r[2] + gap, r[3] + gap), box) for r in rects)
 
-    shrink, note = 1.0, None
-    pc, px_, py_, sc = place(shrink)
-    if _overlap(text_box, (px_, py_, px_ + pc.width, py_ + pc.height)):
-        shrink = 0.9
-        pc, px_, py_, sc = place(shrink)
-        note = "product shrunk 10% to avoid text"
-        if _overlap(text_box, (px_, py_, px_ + pc.width, py_ + pc.height)):
+    def sized(sc):
+        return cut.resize((max(1, int(cut.width * sc)), max(1, int(cut.height * sc))), Image.LANCZOS)
+
+    # Product
+    note = None
+    rest_y = road_top - int(H * 0.015)          # resting just above the road
+    if L.stacked:
+        ax0, ax1 = int(W * L.product_area[0]), int(W * L.product_area[1])
+        max_w_px = min(W * L.product_max_w, ax1 - ax0)
+        max_h_px = min(H * L.product_max_h, stack_room)
+        sc = min(max_w_px / cut.width, max_h_px / cut.height)
+        pc = sized(sc)
+        px_ = ax0 + (ax1 - ax0 - pc.width) // 2
+        py_ = rest_y - pc.height
+    else:
+        # Biggest size that fits bottom-right without touching any text box.
+        right = W - int(W * 0.04)
+        sc_max = min(W * PROMO_SIDE_MAX_W / cut.width, H * L.product_max_h / cut.height)
+        sc, found = sc_max, None
+        while sc >= sc_max * 0.30:
+            w_, h_ = int(cut.width * sc), int(cut.height * sc)
+            box = (right - w_, rest_y - h_, right, rest_y)
+            if not hits_text(box) and box[0] >= int(W * 0.04):
+                found = sc
+                break
+            sc *= 0.97
+        too_small = found is not None and found < sc_max * 0.55
+        if found is None or (too_small and size_key in STACKED_FALLBACK
+                             and L is LAYOUTS.get(size_key)):
+            # caller retries STORE/POST with the stacked layout
             raise ToolError("H01", "Promo text and product overlap", status=422)
+        pc = sized(found)
+        sc = found
+        px_, py_ = right - pc.width, rest_y - pc.height
+        if found < sc_max * 0.999:
+            note = f"product sized to {found / sc_max:.0%} of max to stay clear of the text"
 
     s = W / 2048
     paste_with_shadow(canvas, pc, px_, py_, 0.30, max(1, int(28 * s)), max(1, int(14 * s)))
