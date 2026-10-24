@@ -25,8 +25,13 @@ from PIL import Image
 
 from . import imaging as T
 from . import protect as W
+from . import brand as B
 
-VERSION = "1.2.0"
+# v1.2.1: lifestyle corner logo = the logo itself (white text + soft shadow, no white card).
+# imaging.export() and /overlay/logo call imaging.overlay_logo, so it is swapped here.
+T.overlay_logo = B.overlay_logo
+
+VERSION = "1.2.1"
 API_KEY = os.getenv("API_KEY", "")
 MAX_UPLOAD_MB = T.env_float("MAX_UPLOAD_MB", 30)
 # Heavy jobs (cutout) one at a time: protects VPS memory and n8n next to it.
